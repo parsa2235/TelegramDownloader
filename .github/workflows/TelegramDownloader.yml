@@ -139,13 +139,13 @@ jobs:
       - name: 🔧 نصب ابزارهای ضروری
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y p7zip-full curl python3 python3-pip
+          sudo apt-get install -y zip unzip curl python3 python3-pip
 
       - name: 🐍 نصب کتابخانه‌های پایتون
         run: pip3 install requests
 
       # ──────────────────────────────────────
-      # قدم چهارم: ساخت اسکریپت دانلودر (با قابلیت‌های جدید)
+      # قدم چهارم: ساخت اسکریپت دانلودر (روش تقسیم zip)
       # ──────────────────────────────────────
       - name: 📝 ساخت اسکریپت دانلودر مقاوم
         run: |
@@ -233,29 +233,33 @@ jobs:
                           return False, 0
 
           def split_file(filepath, threshold_mb, password=""):
-              """تقسیم فایل با 7z"""
+              """تقسیم فایل با استفاده از zip (روش اثبات‌شده در پروژه تلگرام)"""
               fpath = Path(filepath)
               size_mb = fpath.stat().st_size / 1048576
               if threshold_mb <= 0 or size_mb <= threshold_mb:
                   return [fpath]
 
               print(f"✂️ در حال تقسیم فایل {fpath.name} (حجم: {size_mb:.1f}MB)")
-              base = fpath.with_suffix('').stem
-              cmd = ["7z", "a", f"-v{threshold_mb}m", f"{base}.7z", str(fpath)]
+
+              # ساخت آرشیو zip تقسیم‌شده
+              zip_base = fpath.with_suffix('.zip')
+              cmd = f"zip -s {threshold_mb}m \"{zip_base.name}\" -j \"{fpath.name}\""
               if password:
-                  cmd = ["7z", "a", f"-p{password}", "-mhe=on", "-mx=3", f"-v{threshold_mb}m", f"{base}.7z", str(fpath)]
-              else:
-                  cmd = ["7z", "a", "-mx=3", f"-v{threshold_mb}m", f"{base}.7z", str(fpath)]
+                  # zip -P رمز را به صورت plaintext می‌فرستد (برای امنیت بالاتر می‌توان بعداً 7z را اضافه کرد)
+                  cmd = f"zip -P \"{password}\" -s {threshold_mb}m \"{zip_base.name}\" -j \"{fpath.name}\""
 
-              subprocess.run(cmd, check=True, cwd=fpath.parent)
-              fpath.unlink()  # حذف فایل اصلی
+              print(f"   اجرای: {cmd}")
+              subprocess.run(cmd, shell=True, check=True, cwd=fpath.parent)
 
-              parts = sorted(fpath.parent.glob(f"{base}.7z*"))
-              # rename if only one part
-              if len(parts) == 1 and parts[0].name == f"{base}.7z.001":
-                  new_name = f"{base}.7z"
-                  parts[0].rename(new_name)
-                  parts = [Path(new_name)]
+              # حذف فایل اصلی
+              fpath.unlink()
+
+              # جمع‌آوری قطعات ساخته‌شده (مثلاً فایل.z01, فایل.z02, ..., فایل.zip)
+              parts = sorted(fpath.parent.glob(f"{zip_base.stem}.z*")) + [zip_base]
+              if not parts:
+                  # اگر به هر دلیل قطعات ساخته نشدند، خطا صادر می‌کنیم
+                  raise RuntimeError(f"هیچ قطعه‌ای برای {fpath.name} ساخته نشد!")
+              print(f"   {len(parts)} بخش ساخته شد.")
               return parts
 
           def process_one_link(link, base_dir, password, threshold_mb):
@@ -282,13 +286,11 @@ jobs:
 
               # تقسیم فایل در صورت نیاز
               try:
-                  final_files = []
                   parts = split_file(dest, threshold_mb, password)
-                  for p in parts:
-                      final_files.append(p)
-                  return final_files, size, None
+                  return parts, size, None
               except Exception as e:
                   print(f"❌ خطا در تقسیم فایل: {e}")
+                  # در صورت خطا، فایل اصلی را نگه می‌داریم تا از دست نرود
                   return [dest], size, None
 
           def main():
@@ -326,7 +328,6 @@ jobs:
 
               # اعمال نام سفارشی (اگر فقط یک فایل اصلی وجود داشته باشد)
               if custom_filename and len(results) == 1:
-                  # اگر split نشده و یک فایل است
                   final_files, size = results[0]
                   if len(final_files) == 1:
                       dest = final_files[0]
@@ -458,7 +459,6 @@ jobs:
             exit 1
           fi
 
-          # جمع‌آوری فایل‌های جدید (بدون فایل‌های موقت و json)
           mapfile -t NEW_FILES < <(find downloads -type f ! -name ".download_results.json" ! -name "*.partial")
           [ -f Links.md ] && NEW_FILES+=("Links.md")
 
@@ -469,13 +469,12 @@ jobs:
           fi
           echo "🔢 تعداد فایل‌های جدید: $TOTAL_FILES"
 
-          MAX_BATCH_SIZE_MB=100  # حداکثر حجم هر دسته: 100 مگابایت
+          MAX_BATCH_SIZE_MB=100
           batch=()
           batch_size_mb=0
 
           for file in "${NEW_FILES[@]}"; do
             file_size_mb=$(( $(stat -c%s "$file") / 1048576 ))
-            # اگر اضافه کردن این فایل حجم دسته را از 100MB بگذراند، دسته فعلی را push کن
             if [ $((batch_size_mb + file_size_mb)) -gt $MAX_BATCH_SIZE_MB ] && [ ${#batch[@]} -gt 0 ]; then
               echo "📦 ارسال دسته با حجم تقریبی ${batch_size_mb}MB (${#batch[@]} فایل)"
               git add "${batch[@]}"
@@ -501,7 +500,6 @@ jobs:
             batch_size_mb=$((batch_size_mb + file_size_mb))
           done
 
-          # ارسال دستهٔ آخر (اگر باقی‌مانده باشد)
           if [ ${#batch[@]} -gt 0 ]; then
             echo "📦 ارسال آخرین دسته با حجم تقریبی ${batch_size_mb}MB (${#batch[@]} فایل)"
             git add "${batch[@]}"
