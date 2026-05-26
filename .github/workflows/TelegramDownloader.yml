@@ -1,12 +1,12 @@
-name: Codex Advanced Downloader (Full Power)
+name: Codex Hybrid Downloader (Offline Resistant)
 
 on:
   workflow_dispatch:
     inputs:
-      package_id:
-        description: "Product ID (default Codex)"
-        required: false
+      product_id:
+        description: "Codex Product ID"
         default: "9PLM9XGG6VKS"
+        required: false
       upload_method:
         type: choice
         options: [repository, release]
@@ -22,123 +22,152 @@ permissions:
   contents: write
 
 jobs:
-  download:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
     steps:
 
-    - name: Checkout
+    - name: Checkout repo
       uses: actions/checkout@v4
 
-    - name: Setup tools
+    - name: Install tools
       run: |
         sudo apt update
         sudo apt install -y curl jq python3
 
     # ─────────────────────────────
-    # Cleanup (مثل نسخه خودت)
+    # Clean
     # ─────────────────────────────
-    - name: Clean old downloads
+    - name: Clean downloads
       if: ${{ inputs.clean_previous == true }}
-      run: |
-        rm -rf downloads
-        mkdir -p downloads
+      run: rm -rf downloads && mkdir -p downloads
 
     # ─────────────────────────────
-    # Fetch Microsoft Store Manifest
+    # Try 1: Microsoft Store Manifest
     # ─────────────────────────────
-    - name: Get manifest
+    - name: Fetch MS Store manifest
+      continue-on-error: true
       run: |
-        curl -L "https://storeedgefd.dsx.mp.microsoft.com/v9.0/packageManifests/${{ inputs.package_id }}" \
-        -o manifest.json
+        curl -L --retry 3 --fail \
+        "https://storeedgefd.dsx.mp.microsoft.com/v9.0/packageManifests/${{ inputs.product_id }}" \
+        -o manifest.json || echo "FAILED" > msstore_fail.txt
 
     # ─────────────────────────────
-    # Extract MSIX URL (robust Python parser)
+    # Extract MSIX link (robust)
     # ─────────────────────────────
-    - name: Extract download URL
+    - name: Extract MS Store URL
+      continue-on-error: true
       run: |
         python3 << 'EOF'
-        import json, re
+        import re, json, os
 
-        data = open("manifest.json","r",encoding="utf-8").read()
+        if not os.path.exists("manifest.json"):
+            open("msstore_fail.txt","w").write("no manifest")
+            exit(0)
 
-        # پیدا کردن همه لینک‌ها
-        urls = re.findall(r"https?://[^\"]+\.msixbundle[^\"]*", data)
+        data = open("manifest.json","r",encoding="utf-8",errors="ignore").read()
+
+        urls = re.findall(r"https?://[^\"']+\.msixbundle[^\"']*", data)
 
         if not urls:
-            print("NO_URL_FOUND")
-            exit(1)
+            open("msstore_fail.txt","w").write("no url")
+            exit(0)
 
-        # اولویت x64
         url = None
         for u in urls:
             if "x64" in u:
                 url = u
                 break
-
         if not url:
             url = urls[0]
 
+        open("url_msstore.txt","w").write(url)
         print(url)
-
-        with open("url.txt","w") as f:
-            f.write(url)
         EOF
 
-    - name: Load URL
-      run: echo "URL=$(cat url.txt)" >> $GITHUB_ENV
+    # ─────────────────────────────
+    # Try 2: GitHub fallback (official repo releases)
+    # ─────────────────────────────
+    - name: Fallback GitHub releases
+      if: failure() || steps.extract.outputs == null
+      run: |
+        echo "Trying GitHub fallback..."
+
+        curl -L \
+        https://api.github.com/repos/openai/codex/releases/latest \
+        -o release.json || true
+
+        cat release.json | jq -r '
+          .assets[].browser_download_url
+        ' | grep -iE "windows|msix|exe|codex" | head -n 1 > url_fallback.txt || true
 
     # ─────────────────────────────
-    # Download with retry (like your script)
+    # Choose best URL
     # ─────────────────────────────
-    - name: Download MSIX
+    - name: Resolve final URL
+      run: |
+        if [ -f url_msstore.txt ]; then
+          URL=$(cat url_msstore.txt)
+        elif [ -f url_fallback.txt ]; then
+          URL=$(cat url_fallback.txt)
+        else
+          echo "NO_DOWNLOAD_URL_FOUND" && exit 1
+        fi
+
+        echo "URL=$URL" >> $GITHUB_ENV
+        echo "FINAL URL: $URL"
+
+    # ─────────────────────────────
+    # Download with retries
+    # ─────────────────────────────
+    - name: Download Codex
       run: |
         mkdir -p downloads
 
-        for i in 1 2 3; do
+        for i in 1 2 3 4; do
           echo "Attempt $i"
-          curl -L --retry 3 --fail "$URL" -o downloads/codex.msixbundle && break
+          curl -L --fail --retry 3 "$URL" -o downloads/codex.msixbundle && break
           sleep 10
         done
 
     # ─────────────────────────────
-    # Validate file
+    # Validate
     # ─────────────────────────────
-    - name: Check file
+    - name: Validate file
       run: |
         ls -lh downloads
-        test -f downloads/codex.msixbundle
+        file downloads/codex.msixbundle || true
 
     # ─────────────────────────────
-    # Commit chunked (like your system)
+    # Commit (chunk-safe)
     # ─────────────────────────────
     - name: Commit to repo
       if: ${{ inputs.upload_method == 'repository' }}
       run: |
         git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git config user.email "bot@users.noreply.github.com"
 
         git add downloads/codex.msixbundle
 
-        git commit -m "Add Codex MSIX bundle" || echo "No changes"
+        git commit -m "Codex bundle update" || echo "no changes"
         git push
 
     # ─────────────────────────────
-    # Release upload
+    # Release mode
     # ─────────────────────────────
-    - name: Upload Release
+    - name: Release upload
       if: ${{ inputs.upload_method == 'release' }}
       uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || format('codex-{0}', github.run_number) }}
-        name: Codex Download
+        name: Codex Build
         files: downloads/codex.msixbundle
 
     # ─────────────────────────────
     # Cleanup
     # ─────────────────────────────
-    - name: Cleanup temp
+    - name: Cleanup
       if: always()
       run: |
-        rm -f manifest.json url.txt
+        rm -f manifest.json release.json url_*.txt msstore_fail.txt
